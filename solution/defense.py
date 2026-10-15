@@ -54,8 +54,17 @@ def _tool_error(pillar, result):
 
 
 def check_contract_checkpoint(payload, ctx):
-    # TODO: ctx.tools.contract_diff(payload["contract_id"], payload["checkpoint_batch_id"])
-    return Verdict(alert=False, pillar="contracts")
+    diff = ctx.tools.contract_diff(payload["contract_id"], payload["checkpoint_batch_id"])
+    if "error" in diff:
+        return _tool_error("contracts", diff)
+    signals = list(diff["violations"])
+    limit = ctx.baseline["freshness_delay_max_min"]
+    declared_sla = payload.get("declared_sla") or {}
+    if declared_sla.get("freshness_min") is not None:
+        limit = min(limit, declared_sla["freshness_min"])
+    if diff["freshness_delay_min"] > limit:
+        signals.append("contract freshness exceeded")
+    return Verdict(alert=bool(signals), pillar="contracts", reason="; ".join(signals))
 
 
 def check_lineage_run(payload, ctx):
