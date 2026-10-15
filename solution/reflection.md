@@ -1,6 +1,6 @@
 # Thu hoạch Data Siege
 
-**Sinh viên:** Nguyễn Ngọc Tuyên — 2A202603010 — Day 27, Track 2.
+**Sinh viên:** Nguyễn Ngọc Tuyền — 2A202603010 — Day 27, Track 2.
 
 ## Những lỗi khó phát hiện
 
