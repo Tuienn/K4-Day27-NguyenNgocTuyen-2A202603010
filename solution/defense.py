@@ -68,8 +68,20 @@ def check_contract_checkpoint(payload, ctx):
 
 
 def check_lineage_run(payload, ctx):
-    # TODO: ctx.tools.lineage_graph_slice(payload["run_id"])
-    return Verdict(alert=False, pillar="lineage")
+    graph = ctx.tools.lineage_graph_slice(payload["run_id"])
+    if "error" in graph:
+        return _tool_error("lineage", graph)
+    signals = []
+    if graph["actual_downstream_count"] == 0:
+        signals.append("orphan output")
+    # Required inputs of the stg_orders transform described in phase.txt.
+    required = {"raw.orders", "raw.customers"}
+    missing = required - set(graph["actual_upstream"])
+    if missing:
+        signals.append("missing upstream: " + ", ".join(sorted(missing)))
+    if graph["duration_ms"] > ctx.baseline["lineage_duration_ms_max"]:
+        signals.append("anomalous transform runtime")
+    return Verdict(alert=bool(signals), pillar="lineage", reason="; ".join(signals))
 
 
 def check_feature_materialization(payload, ctx):
