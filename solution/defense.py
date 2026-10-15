@@ -85,8 +85,15 @@ def check_lineage_run(payload, ctx):
 
 
 def check_feature_materialization(payload, ctx):
-    # TODO: ctx.tools.feature_drift(payload["feature_view"], payload["batch_id"])
-    return Verdict(alert=False, pillar="ai_infra")
+    drift = ctx.tools.feature_drift(payload["feature_view"], payload["batch_id"])
+    if "error" in drift:
+        return _tool_error("ai_infra", drift)
+    # phase.txt documents natural serving variation above the historical
+    # baseline; 0.65 sigma leaves room for it while detecting subtle skew.
+    limit = max(0.65, ctx.baseline["feature_mean_shift_sigma_max"])
+    alert = drift["mean_shift_sigma"] > limit
+    return Verdict(alert=alert, pillar="ai_infra",
+                   reason="training-serving feature skew" if alert else "")
 
 
 def check_embedding_batch(payload, ctx):
