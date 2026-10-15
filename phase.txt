@@ -1,0 +1,227 @@
+Giải mã kiến trúc Data Siege và bài toán đánh đổi chi phí
+Mục tiêu: Hiểu rõ cơ chế chấm điểm đa mục tiêu, bản chất của 4 trụ cột lỗi dữ liệu, và thiết kế chiến lược phễu lọc chi phí thông minh.
+
+Công thức tính điểm và bài toán cân bằng lợi ích
+Hệ thống đánh giá hiệu năng giải pháp của bạn theo công thức:
+
+Score = 100 × (0.5 · TPR − 0.3 · FPR − 0.2 · min(cost_overage, 1.0))
+Chép
+Trong đó:
+
+TPR (True Positive Rate - Tỷ lệ bắt trúng): Số lỗi bắt được chia cho tổng số lỗi thực tế có trong luồng stream. Trọng số đóng góp tối đa là +50 điểm.
+FPR (False Positive Rate - Tỷ lệ báo động giả): Số sự kiện bình thường bị gắn nhãn lỗi nhầm chia cho tổng số sự kiện bình thường. Trọng số phạt là -30 điểm (báo động giả trong vận hành gây Alert Fatigue và lãng phí tài nguyên xử lý sự cố).
+cost_overage (Tỷ lệ chi phí vượt ngân sách): Mức độ chi phí vượt ngân sách cho phép, được tính theo công thức:
+cost_overage = max(0, (Total Spend − Budget) / Budget)
+Chép
+(Trong đó Total Spend là tổng chi phí gọi Tool thực tế và Budget là ngân sách được cấp cho phase). Nếu vượt quá ngân sách, bạn bị trừ tối đa -20 điểm.
+
+                     MA TRẬN ĐÁNH ĐỔI ĐIỂM SỐ (TRADE-OFF)
+┌───────────────────────────┬─────────────────────────────────────────────────┐
+│ Chiến lược                │ Kết quả điểm số                                 │
+├───────────────────────────┼─────────────────────────────────────────────────┤
+│ Cảnh báo toàn bộ (Alert All)│ TPR=1.0 nhưng FPR=1.0 -> Điểm giảm xuống 20.0 │
+│ Bỏ qua toàn bộ (Mute All) │ TPR=0.0 -> Điểm bằng 0.0                       │
+│ Gọi công cụ trùng lặp     │ Overage vượt trần -> Bị phạt trừ tối đa 20.0    │
+│ Phân tầng chi phí chuẩn   │ Mỗi event gọi tối đa 1 tool, FPR=0% -> Điểm tối ưu│
+└───────────────────────────┴─────────────────────────────────────────────────┘
+Chép
+3 Phase kiểm thử và đặc trưng dòng dữ liệu
+Hệ thống cung cấp 3 pha thử nghiệm với độ khó tăng dần:
+
+1. Phase Practice (120 events, Budget: 220.0 credits): Pha học tập không giới hạn. Repo cung cấp sẵn file đáp án phases/practice_answer_key.json. Các lỗi ở pha này là lỗi có độ lệch lớn (obvious faults), giúp kiểm tra tính chính xác của cú pháp gọi API và logic xử lý cơ bản.
+2. Phase Public (160 events, Budget: 220.0 credits): Pha thử tải chung. Ngân sách ở pha này bị siết chặt (full scan tốn 240 credits nhưng budget chỉ có 220). Pha này kiểm tra năng lực cân đối ngân sách và chỉ trả về phân hạng tổng quan (high, medium, low) theo từng trụ cột chứ không lộ đáp án chi tiết.
+3. Phase Private (200 events, Budget: 320.0 credits): Pha quyết định điểm số của bạn. Luồng dữ liệu mới hoàn toàn, chứa nhiều lỗi tinh vi (subtle faults) nằm sát dải dao động tự nhiên.
+Kiến trúc phân tầng chi phí: Tận dụng Metadata trước khi gọi Tool
+Mỗi khi một sự kiện đến hàm handler của bạn, đối tượng ctx (SiegeContext) cung cấp các tài nguyên:
+
+payload (Miễn phí): Chứa metadata của sự kiện (tên bảng, batch_id, tên job dbt, schema khai báo, v.v.).
+ctx.baseline (Miễn phí): Dictionary chứa các hằng số đo lường chuẩn hóa ở ngưỡng 3σ trên dữ liệu sạch lịch sử (data/baselines.json).
+ctx.state (Miễn phí): Dictionary in-memory tồn tại xuyên suốt từ đầu đến cuối một lần chạy. Bạn có thể tự do lưu mảng, đếm số lần xuất hiện hoặc tính trung bình động mà không tốn credit.
+ctx.tools (Tốn phí credits): Các RPC gọi về server để trích xuất dữ liệu sâu của pipeline.
+Kiến trúc Phễu Lọc Sự Kiện
+Phát hiện bất thường rõ rệt
+
+Bình thường hoặc nhiễu nhẹ
+
+Sự kiện tới từ Stream
+
+1. Đọc Payload & Metadata (Miễn phí)
+
+2. Truy xuất ctx.baseline & ctx.state (Miễn phí)
+
+3. Gọi đúng 1 Tool phù hợp qua ctx.tools (Tốn phí)
+
+4. Đánh giá Đa chiều (Single-dim + Multi-dim)
+
+Verdict(alert=True, pillar=...)
+
+Verdict(alert=False, pillar=...)
+
+Bảng tra cứu công cụ đo lường và chi phí trong docs/TOOLKIT_API.md:
+
+Phương thức trong ctx.tools	Chi phí	Dữ liệu trả về	Event xử lý tương ứng
+batch_profile(batch_id)	1.0 credit	{row_count, null_rate, mean_amount, std_amount, staleness_min}	data_batch
+contract_diff(contract_id, checkpoint_batch_id)	1.5 credits	{freshness_delay_min, violations: [...]}	contract_checkpoint
+lineage_graph_slice(run_id)	1.0 credit	{duration_ms, actual_upstream, actual_downstream_count}	lineage_run
+feature_drift(feature_view, ref)	2.0 credits	{serve_mean, train_mean, train_std, mean_shift_sigma}	feature_materialization
+embedding_drift(corpus, ref)	2.0 credits	{centroid_shift, avg_doc_age_days}	embedding_batch
+spend_so_far() & budget_remaining()	Miễn phí	Số credit đã dùng / còn lại trong ngân sách	Quản lý hạn mức
+
+Thuật toán phát hiện lỗi cho 5 luồng sự kiện
+Mục tiêu: Hiểu rõ bản chất lỗi của từng sự kiện, thiết lập tư duy thuật toán và lập trình hoàn thiện các handler trong solution/defense.py.
+
+Mở file solution/defense.py, bạn sẽ thấy cấu trúc khởi tạo sẵn:
+
+from api import Verdict
+
+def register(ctx):
+    ctx.on("data_batch", check_data_batch)
+    ctx.on("contract_checkpoint", check_contract_checkpoint)
+    ctx.on("lineage_run", check_lineage_run)
+    ctx.on("feature_materialization", check_feature_materialization)
+    ctx.on("embedding_batch", check_embedding_batch)
+Chép
+Dưới đây là phương pháp phân tích và xử lý từng loại sự kiện:
+
+1. Luồng data_batch (Pillar: checks)
+Bản chất lỗi: Lỗi chất lượng dữ liệu trên bảng đơn hàng (orders): lượng đơn hàng tăng vọt bất thường (volume_spike) hoặc tụt giảm mạnh (volume_drop), mất dữ liệu định danh khách hàng (null_spike), đơn hàng bị chậm trễ cập nhật (freshness_lag), và giá trị tiền giao dịch bị lệch phân phối (distribution_shift).
+Tư duy thuật toán:
+1. Trích xuất profile qua ctx.tools.batch_profile(payload["batch_id"]).
+2. So sánh từng chiều đơn lẻ với ctx.baseline:
+Số hàng ngoài khoảng [row_count_min, row_count_max]
+Tỷ lệ null của customer_id vượt quá null_rate_max
+Giá trị đơn hàng trung bình ngoài khoảng [mean_amount_min, mean_amount_max]
+Độ trễ đơn hàng vượt quá staleness_min_max
+1. Phát hiện bất thường đa chiều (Multi-signal Composite Distance): Một số đợt dữ liệu có từng chỉ số đơn lẻ vẫn nằm trong ngưỡng biên 3σ nhưng bị lệch đồng thời trên nhiều chiều (ví dụ: số hàng cao, giá trị trung bình cao, độ trễ tăng). Để phát hiện dạng lỗi này mà không gây False Positive trên từng chiều riêng lẻ, chuẩn hóa độ lệch của từng biến và tính khoảng cách Euclidean tổng hợp:
+norm2 = √( ((rows − μ_rows) / σ_rows)² + ((mean − μ_mean) / σ_mean)² + (null / null_max)² + (stale / stale_max)² )
+Chép
+Khi giá trị norm2 vượt ngưỡng xác định (ví dụ: norm2 > 1.30), hệ thống kích hoạt cảnh báo.
+
+2. Luồng contract_checkpoint (Pillar: contracts)
+Bản chất lỗi: Vi phạm Data Contract đã ký kết giữa dịch vụ thanh toán (checkout-service) và kho dữ liệu: producer tự ý đổi kiểu dữ liệu của số tiền từ số thực sang chuỗi (type_violation), thay đổi schema khiến mã băm hash bị sai lệch (schema_break), hoặc vi phạm cam kết thời gian hoàn thành SLA (sla_violation).
+Tư duy thuật toán:
+1. Gọi ctx.tools.contract_diff(payload["contract_id"], payload["checkpoint_batch_id"]).
+2. Bất kỳ khi nào mảng violations trả về có phần tử (ví dụ: "schema_hash_mismatch" hoặc "type_violation"), đó là vi phạm hợp đồng chắc chắn → Báo động ngay.
+3. Đọc trường payload.get("declared_sla", {}).get("freshness_min") (cam kết 15 phút). Nếu freshness_delay_min thực tế lớn hơn cam kết này hoặc vượt quá ctx.baseline["freshness_delay_max_min"] → Báo động.
+3. Luồng lineage_run (Pillar: lineage)
+Bản chất lỗi: Lỗi trong đồ thị biến đổi dữ liệu (DAG) của dbt: bảng đầu ra không có mô hình downstream nào kế thừa tiêu thụ (orphan_output), câu lệnh transform bị mất phụ thuộc vào bảng đầu vào thiết yếu (missing_upstream), hoặc thời gian chạy của job bị nghẽn bất thường (runtime_anomaly).
+Tư duy thuật toán:
+1. Gọi ctx.tools.lineage_graph_slice(payload["run_id"]).
+2. Bắt Orphan Output: Kiểm tra slice_data.get("actual_downstream_count") == 0. Bảng tạo ra mà không có ai đọc là dấu hiệu của transform bị bỏ rơi.
+3. Bắt Missing Upstream: Quan sát đồ thị dbt chuẩn của model dbt:stg_orders. Để làm giàu dữ liệu đơn hàng, nó bắt buộc phải kết hợp cả raw.orders và raw.customers. Nếu trong danh sách actual_upstream bị thiếu một trong hai bảng này, đường ống đã bị đứt gãy phụ thuộc!
+4. Bắt Runtime Anomaly: Kiểm tra nếu duration_ms vượt quá trần baseline danh định lineage_duration_ms_max.
+4. Luồng feature_materialization (Pillar: ai_infra)
+Bản chất lỗi: Trôi dạt đặc trưng (Feature Drift) và Training-Serving Skew trong Feature Store: phân phối feature phục vụ dự đoán thời gian thực (serving) bị sai lệch nghiêm trọng so với phân phối feature lúc huấn luyện (training), khiến mô hình AI suy giảm chất lượng dự báo giá trị trọn đời của khách hàng (customer_ltv_features).
+Tư duy thuật toán:
+1. Gọi ctx.tools.feature_drift(payload["feature_view"], payload["batch_id"]).
+2. Tool trả về đại lượng đo lường độ lệch chuẩn hóa:
+mean_shift_sigma = |serve_mean − train_mean| / train_std
+Chép
+1. Hiệu chuẩn ngưỡng phân tách (Threshold Calibration): Hằng số ctx.baseline["feature_mean_shift_sigma_max"] = 0.4095 phản ánh biên lịch sử. Trên luồng stream thực tế, dữ liệu bình thường có dao động tự nhiên lên tới 0.472. Nếu dùng trực tiếp giá trị 0.4095 làm ngưỡng cứng, hệ thống sẽ phát sinh False Positives. Ngược lại, các trường hợp skew thực tế có độ dịch chuyển từ 0.970 trở lên.
+2. Ngưỡng đề xuất: Chọn ngưỡng phân tách nằm trong khoảng giữa giá trị lớn nhất của dữ liệu bình thường và giá trị nhỏ nhất của dữ liệu lỗi (ví dụ: ngưỡng ≈ 0.65).
+5. Luồng embedding_batch (Pillar: ai_infra)
+Bản chất lỗi: Lỗi trong hệ thống RAG / Tìm kiếm ngữ nghĩa: trọng tâm không gian vector của các đoạn tài liệu hỗ trợ (support_docs) bị trôi dạt ngữ nghĩa so với tập tham chiếu (embedding_drift), hoặc kho tri thức bị cũ kỹ quá hạn do tài liệu không được tái lập chỉ mục định kỳ (corpus_staleness).
+Tư duy thuật toán:
+1. Gọi ctx.tools.embedding_drift(payload["corpus"], payload["chunk_batch_id"]).
+2. So sánh centroid_shift với dải trôi dạt tối đa của dữ liệu sạch (dữ liệu sạch dao động dưới 0.039, các ca trôi dạt rõ rệt vượt trên 0.040).
+3. So sánh tuổi thọ tài liệu trung bình avg_doc_age_days với hạn mức an toàn của kho tài liệu (tài liệu sạch có tuổi trung bình dưới 41 ngày; kho tài liệu quá hạn lỗi có tuổi từ 48 đến 168 ngày).
+
+
+Thực thi, gỡ lỗi chéo và phòng chống Overfit
+Mục tiêu: Chạy thử nghiệm trên phase Practice, sử dụng file đáp án gốc để đối chiếu ma trận nhầm lẫn, tinh chỉnh giải pháp và chuẩn bị nộp bài.
+
+Bước 1: Chạy thử nghiệm trên Phase Practice
+Chạy lệnh thực thi phase Practice để giải mã luồng sự kiện trong bộ nhớ và ghi nhận báo cáo kết quả:
+
+.\.venv\Scripts\python.exe harness\run.py --phase practice --defense solution/defense.py --out solution/practice_report.json
+Chép
+Kết quả in ra màn hình sẽ bao gồm điểm số sơ bộ, chi phí tiêu thụ, và mảng danh sách các quyết định verdicts của bạn.
+
+Bước 2: Tự đối chiếu với file đáp án gốc (practice_answer_key.json)
+File phases/practice_answer_key.json cung cấp nhãn thực tế cho 120 sự kiện trong phase Practice. Sử dụng đoạn script sau để so sánh mảng verdicts trong solution/practice_report.json với nhãn gốc và đánh giá ma trận nhầm lẫn:
+
+import json
+
+# Đọc báo cáo của bạn và đáp án gốc
+report = json.loads(open("solution/practice_report.json").read())["result"]
+answers = json.loads(open("phases/practice_answer_key.json").read())
+
+tp = fp = fn = tn = 0
+for v, a in zip(report["verdicts"], answers):
+    alerted = v["alert"]
+    actual = a["is_faulty"]
+    if actual and alerted: tp += 1
+    elif not actual and alerted: fp += 1
+    elif actual and not alerted: fn += 1
+    else: tn += 1
+
+print(f"Kết quả: TP={tp}, FP={fp}, FN={fn}, TN={tn}")
+print(f"TPR = {tp/(tp+fn):.4f} | FPR = {fp/(fp+tn):.4f}")
+Chép
+Nếu FP > 0: Ngưỡng kiểm tra đang quá nhạy hoặc chưa bao quát hết dải dao động bình thường của dữ liệu. Cần đối chiếu lại giá trị cực đại của dữ liệu sạch trong baseline.
+Nếu FN > 0: Hệ thống bỏ sót trường hợp lỗi. Cần kiểm tra lại các điều kiện biên của từng trường dữ liệu (ví dụ: trong lineage run, đã kiểm tra điều kiện actual_downstream_count == 0 chưa).
+Bước 3: Kiểm thử trên Phase Public và kiểm soát Overfitting
+Sau khi đạt điểm tối đa 50.0 ở Practice, bạn hãy chạy thử phase Public:
+
+.\.venv\Scripts\python.exe harness\run.py --phase public --defense solution/defense.py --out solution/public_report.json
+Chép
+Ở phase Public:
+
+Bạn sẽ thấy chi phí gọi tool là 240.0 credits trong khi ngân sách là 220.0 credits (tỷ lệ overage là 0.0909). Đừng lo sợ và đừng tìm cách bỏ qua không gọi tool! Mất 1.82 điểm do overage vẫn tốt hơn nhiều so với việc bỏ sót các lỗi thực tế (mất trên 4 điểm TPR).
+Kiểm tra xem 4 trụ cột lỗi có đạt dải băng tần "high" hay không.
+
+
+
+Bảng xử lý sự cố thường gặp (Student Troubleshooting)
+Dưới đây là các sự cố kỹ thuật phổ biến nhất bạn có thể gặp phải trong quá trình làm bài và cách khắc phục tức thì:
+
+Triệu chứng lỗi	Nguyên nhân gốc rễ	Cách khắc phục ngay trong 1 phút
+EOFError: child process died. stderr: ...	Bạn đã dùng lệnh print(...) trong solution/defense.py, làm ô nhiễm kênh stdout giao tiếp JSON-RPC.	Mở defense.py, xóa bỏ print(...) hoặc đổi thành: print("log", file=sys.stderr).
+ImportError: 'numpy' is not importable from defense.py	Bạn đã import thư viện ngoài không nằm trong danh mục cho phép của sandbox.	Chỉ sử dụng các thư viện chuẩn có sẵn: math, statistics, json, collections...
+PermissionError khi gọi open()	Sandbox đã vô hiệu hóa thao tác I/O trên đĩa cứng để đảm bảo tính an toàn.	Muốn lưu lại dữ liệu giữa các sự kiện, hãy lưu vào dictionary in-memory: ctx.state["my_key"] = data.
+Điểm ở phase Public bị trừ do overage (240 / 220 credits)	Số lượng event ở Public là 160, mỗi event tốn 1-2 credits dẫn đến tổng chi phí là 240 credits.	Đây là kịch bản thử nghiệm đánh đổi chi phí: chấp nhận mức phạt overage nhỏ (1.82 điểm) để duy trì tỷ lệ phát hiện lỗi tối đa (TPR = 1.0, tương đương 50 điểm).
+Lỗi đường dẫn .venv/bin/... trên Windows	Bạn đang copy lệnh dành cho Linux vào terminal Windows PowerShell.	Thay thế bằng đường dẫn Windows: .\.venv\Scripts\python.exe và .\.venv\Scripts\pip.exe.
+
+
+Xác nhận hoàn thành và quy trình nộp bài
+Mục tiêu: Chạy phase Private chính thức, điền thông tin manifest và đóng gói nộp bài theo đúng quy định.
+
+Bước 1: Chạy Phase Private lấy kết quả chính thức
+Khi đến thời điểm mở phase Private, bạn hãy chạy lệnh thực thi chính thức:
+
+.\.venv\Scripts\python.exe harness\run.py --phase private --defense solution/defense.py --out solution/private_report.json
+Chép
+File solution/private_report.json sẽ được sinh ra kèm chữ ký số cryptographic HMAC-SHA256 nhằm đảm bảo kết quả không bị can thiệp chỉnh sửa thủ công.
+
+Bước 2: Khai báo thông tin vào Manifest
+Mở file submission/manifest.json và điền tên của bạn hoặc tên đội thi:
+
+{
+  "team_or_student": "K18-D27-NguyenVanA-123456",
+  "defense_file": "solution/defense.py",
+  "reflection_file": "solution/reflection.md",
+  "private_report_file": "solution/private_report.json"
+}
+Chép
+Bước 3: Viết thu hoạch vào solution/reflection.md
+Mở file solution/reflection.md và viết một bài đúc kết ngắn gọn (khoảng 1 trang):
+
+Loại lỗi nào bạn thấy khó phát hiện nhất trong 5 luồng sự kiện?
+Quyết định cân bằng giữa chi phí gọi công cụ (ctx.tools) và tỷ lệ bắt trúng lỗi (TPR) của bạn đã diễn ra như thế nào?
+Nếu được cấp thêm thời gian, bạn sẽ cải tiến cơ chế thống kê nào trong ctx.state?
+Bước 4: Kiểm tra cấu trúc thư mục nộp bài
+Theo quy chuẩn nộp bài VLearn, cấu trúc thư mục nộp bài cá nhân của bạn cần có định dạng:
+
+# Cấu trúc nộp bài Cá nhân
+KX-DAY27-HoVaTen-MSSV/
+├── solution/
+│   ├── defense.py
+│   ├── reflection.md
+│   ├── practice_report.json
+│   ├── public_report.json
+│   └── private_report.json
+├── submission/
+│   └── manifest.json
+└── ...
+Chép
+Tiến hành commit, yêu càu mỗi pha chức năng  là 1 commit
