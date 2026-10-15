@@ -97,5 +97,16 @@ def check_feature_materialization(payload, ctx):
 
 
 def check_embedding_batch(payload, ctx):
-    # TODO: ctx.tools.embedding_drift(payload["corpus"], payload["chunk_batch_id"])
-    return Verdict(alert=False, pillar="ai_infra")
+    drift = ctx.tools.embedding_drift(payload["corpus"], payload["chunk_batch_id"])
+    if "error" in drift:
+        return _tool_error("ai_infra", drift)
+    # Use the tighter operational limits from phase.txt: clean shift < .039
+    # and clean corpus age < 41 days, including subtler private instances.
+    shift_limit = min(0.040, ctx.baseline["embedding_centroid_shift_max"])
+    age_limit = min(45.0, ctx.baseline["corpus_avg_doc_age_days_max"])
+    signals = []
+    if drift["centroid_shift"] > shift_limit:
+        signals.append("embedding centroid drift")
+    if drift["avg_doc_age_days"] > age_limit:
+        signals.append("stale retrieval corpus")
+    return Verdict(alert=bool(signals), pillar="ai_infra", reason="; ".join(signals))
