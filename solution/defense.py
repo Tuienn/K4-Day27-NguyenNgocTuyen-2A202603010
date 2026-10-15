@@ -1,8 +1,4 @@
-"""
-Your defense. Implement register(ctx) and a handler per event type.
-See ../README.md for the full interface + toolkit reference, and
-../RULES.md before you start.
-"""
+"""Streaming pipeline checks using one documented RPC per event."""
 from api import Verdict
 
 
@@ -15,9 +11,46 @@ def register(ctx):
 
 
 def check_data_batch(payload, ctx):
-    # TODO: call ctx.tools.batch_profile(payload["batch_id"]) and compare
-    # against ctx.baseline's row_count/null_rate/mean_amount/staleness bounds.
-    return Verdict(alert=False, pillar="checks")
+    profile = ctx.tools.batch_profile(payload["batch_id"])
+    if "error" in profile:
+        return _tool_error("checks", profile)
+    b = ctx.baseline
+    rows = profile["row_count"]
+    amount = profile["mean_amount"]
+    nulls = profile["null_rate"]["customer_id"]
+    stale = profile["staleness_min"]
+    signals = []
+    if not b["row_count_min"] <= rows <= b["row_count_max"]:
+        signals.append("volume outside historical bounds")
+    if not b["mean_amount_min"] <= amount <= b["mean_amount_max"]:
+        signals.append("order amount distribution shifted")
+    if nulls > b["null_rate_max"]:
+        signals.append("customer identifier null spike")
+    if stale > b["staleness_min_max"]:
+        signals.append("stale order batch")
+
+    # Scale two-sided deviations by the historical 3-sigma half-width,
+    # not by sigma: a single metric at its limit contributes exactly 1.
+    row_mid = (b["row_count_min"] + b["row_count_max"]) / 2
+    row_radius = (b["row_count_max"] - b["row_count_min"]) / 2
+    amount_mid = (b["mean_amount_min"] + b["mean_amount_max"]) / 2
+    amount_radius = (b["mean_amount_max"] - b["mean_amount_min"]) / 2
+    distance_squared = (
+        ((rows - row_mid) / row_radius) ** 2
+        + ((amount - amount_mid) / amount_radius) ** 2
+        + (nulls / b["null_rate_max"]) ** 2
+        + (stale / b["staleness_min_max"]) ** 2
+    )
+    if distance_squared > 1.30 ** 2:
+        signals.append("joint quality deviation")
+    return Verdict(alert=bool(signals), pillar="checks", reason="; ".join(signals))
+
+
+def _tool_error(pillar, result):
+    # An unavailable measurement is not proof of a data fault. Keep its
+    # diagnostic visible in the report without charging for a retry.
+    return Verdict(alert=False, confidence=0.0, pillar=pillar,
+                   reason="measurement unavailable: " + str(result["error"]))
 
 
 def check_contract_checkpoint(payload, ctx):
